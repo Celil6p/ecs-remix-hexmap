@@ -1,5 +1,4 @@
-import { useEffect, useRef, useState } from "react";
-import maplibregl from "maplibre-gl";
+import { useEffect, useRef, useState, useCallback } from "react";
 import type { Map } from "maplibre-gl";
 import { generateHexGrid, pixelToHex, hexToPixel, hex, type HexCoordinate, type HexTile } from "~/lib/hexgrid";
 import { gameConfig } from "~/lib/config";
@@ -11,6 +10,16 @@ interface CameraState {
   x: number;
   y: number;
   zoom: number;
+}
+
+interface MapTile {
+  q: number;
+  r: number;
+  terrain: 'grass' | 'mountain' | 'forest' | 'water';
+}
+
+interface ExtendedHexTile extends HexTile {
+  terrain: 'grass' | 'mountain' | 'forest' | 'water';
 }
 
 export default function HexGridGame() {
@@ -26,8 +35,12 @@ export default function HexGridGame() {
   
   const [selectedHex, setSelectedHex] = useState<HexCoordinate | null>(null);
   const [mapMode, setMapMode] = useState<'canvas' | 'maplibre'>('canvas');
-  const [hexTiles, setHexTiles] = useState<HexTile[]>([]);
+  const [hexTiles, setHexTiles] = useState<ExtendedHexTile[]>([]);
   const [isResizing, setIsResizing] = useState(false);
+  const [currentCenterHex, setCurrentCenterHex] = useState<HexCoordinate>({ q: 0, r: 0, s: 0 });
+  const [isLoadingTiles, setIsLoadingTiles] = useState(false);
+  const [allMapData, setAllMapData] = useState<globalThis.Map<string, MapTile> | null>(null);
+  const [isLoadingMapData, setIsLoadingMapData] = useState(true);
   
   // Touch gesture state
   const [gestureState, setGestureState] = useState({
@@ -40,41 +53,193 @@ export default function HexGridGame() {
     startTime: 0
   });
 
-  // Generate hex tiles
-  useEffect(() => {
-    // Generate a simpler grid in meter coordinates centered at (0,0)
-    const tiles: HexTile[] = [];
-    const hexSize = gameConfig.hexGrid.size;
+  // Terrain colors
+  const getTerrainColor = (terrain: string, isSelected: boolean = false) => {
+    if (isSelected) return '#fbbf24';
     
-    // Create a much smaller grid for testing - let's say 20x20 hexes
-    const gridRadius = 16;
+    switch (terrain) {
+      case 'water': return '#3b82f6';
+      case 'grass': return '#22c55e';
+      case 'forest': return '#16a34a';
+      case 'mountain': return '#6b7280';
+      default: return '#9ca3af';
+    }
+  };
+
+  const getTerrainBorderColor = (terrain: string, isSelected: boolean = false) => {
+    if (isSelected) return '#f59e0b';
     
-    for (let q = -gridRadius; q <= gridRadius; q++) {
-      for (let r = -gridRadius; r <= gridRadius; r++) {
-        // Skip if too far from center (make a circular-ish grid)
-        if (Math.abs(q) + Math.abs(r) + Math.abs(-q-r) > gridRadius * 2) continue;
+    switch (terrain) {
+      case 'water': return '#1e40af';
+      case 'grass': return '#15803d';
+      case 'forest': return '#14532d';
+      case 'mountain': return '#374151';
+      default: return '#6b7280';
+    }
+  };
+
+  // Load all map data once
+  const loadMapData = useCallback(async () => {
+    setIsLoadingMapData(true);
+    
+    try {
+      console.log('Loading map data...');
+      const response = await fetch('/map.json');
+      
+      if (!response.ok) {
+        throw new Error(`Failed to fetch map data: ${response.status}`);
+      }
+      
+      const mapData = await response.json();
+      
+      // Create a map for quick lookup
+      const tileMap = new globalThis.Map<string, MapTile>();
+      mapData.tiles.forEach((tile: MapTile) => {
+        tileMap.set(`${tile.q},${tile.r}`, tile);
+      });
+      
+      console.log(`Loaded ${mapData.tiles.length} total tiles from map data`);
+      setAllMapData(tileMap);
+      
+    } catch (error) {
+      console.error('Error loading map data:', error);
+    } finally {
+      setIsLoadingMapData(false);
+    }
+  }, []);
+
+  // Generate tiles that are visible on screen
+  const generateVisibleTiles = useCallback((cameraX: number, cameraY: number, zoom: number) => {
+    if (!allMapData) return;
+    
+    setIsLoadingTiles(true);
+    
+    try {
+      // Get current screen dimensions
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      
+      const { width, height } = canvas;
+      const scale = Math.pow(2, zoom - 1) / 100000;
+      
+      // Calculate viewport bounds in world coordinates with padding for smooth scrolling
+      const paddingFactor = 1.5; // Load 50% more tiles around viewport
+      const viewWidthInMeters = (width / scale) * paddingFactor;
+      const viewHeightInMeters = (height / scale) * paddingFactor;
+      
+      const viewLeft = cameraX - viewWidthInMeters / 2;
+      const viewRight = cameraX + viewWidthInMeters / 2;
+      const viewTop = cameraY + viewHeightInMeters / 2;
+      const viewBottom = cameraY - viewHeightInMeters / 2;
+      
+      // Convert world bounds to hex coordinate bounds
+      const hexSize = gameConfig.hexGrid.size;
+      
+      // Convert viewport corners to hex coordinates
+      const minQ = Math.floor((2/3 * viewLeft) / hexSize) - 2;
+      const maxQ = Math.ceil((2/3 * viewRight) / hexSize) + 2;
+      const minR = Math.floor((-1/3 * viewRight + Math.sqrt(3)/3 * viewBottom) / hexSize) - 2;
+      const maxR = Math.ceil((-1/3 * viewLeft + Math.sqrt(3)/3 * viewTop) / hexSize) + 2;
+      
+      console.log(`Loading tiles for viewport: q(${minQ} to ${maxQ}), r(${minR} to ${maxR})`);
+      
+      // Generate hex tiles for the visible area
+      const tiles: ExtendedHexTile[] = [];
+      const hexesToLoad: HexCoordinate[] = [];
+      
+      for (let q = minQ; q <= maxQ; q++) {
+        for (let r = minR; r <= maxR; r++) {
+          const s = -q - r;
+          const coordinate = { q, r, s };
+          
+          // Convert hex to world position to check if it's actually in viewport
+          const worldX = hexSize * (3/2 * q);
+          const worldY = hexSize * (Math.sqrt(3)/2 * q + Math.sqrt(3) * r);
+          
+          // Check if hex center is roughly within the padded viewport
+          if (worldX >= viewLeft && worldX <= viewRight && 
+              worldY >= viewBottom && worldY <= viewTop) {
+            hexesToLoad.push(coordinate);
+          }
+        }
+      }
+      
+      hexesToLoad.forEach(coordinate => {
+        const tileKey = `${coordinate.q},${coordinate.r}`;
+        const mapTile = allMapData.get(tileKey);
         
-        const coordinate = { q, r, s: -q - r };
+        // If tile doesn't exist in map data, skip it
+        if (!mapTile) return;
         
         // Convert hex coordinate to pixel position in meters (flat-top orientation)
-        const x = hexSize * (3/2 * q);
-        const y = hexSize * (Math.sqrt(3)/2 * q + Math.sqrt(3) * r);
+        const x = hexSize * (3/2 * coordinate.q);
+        const y = hexSize * (Math.sqrt(3)/2 * coordinate.q + Math.sqrt(3) * coordinate.r);
         
-        const tile: HexTile = {
+        const tile: ExtendedHexTile = {
           coordinate,
           center: { x, y },
           vertices: [], // We'll calculate this when rendering
-          id: `hex-${q}-${r}`
+          id: `hex-${coordinate.q}-${coordinate.r}`,
+          terrain: mapTile.terrain
         };
         
         tiles.push(tile);
-      }
+      });
+      
+      console.log(`Generated ${tiles.length} visible tiles at zoom ${zoom.toFixed(1)}, viewport: ${Math.round(viewWidthInMeters/1000)}x${Math.round(viewHeightInMeters/1000)}km`);
+      setHexTiles(tiles);
+      
+    } catch (error) {
+      console.error('Error generating visible tiles:', error);
+    } finally {
+      setIsLoadingTiles(false);
     }
+  }, [allMapData]);
+
+
+
+  // Calculate center hex from camera position
+  const getCenterHexFromCamera = useCallback((cameraX: number, cameraY: number): HexCoordinate => {
+    const hexSize = gameConfig.hexGrid.size;
+    const q = Math.round((2/3 * cameraX) / hexSize);
+    const r = Math.round((-1/3 * cameraX + Math.sqrt(3)/3 * cameraY) / hexSize);
+    const s = -q - r;
     
-    console.log(`Generated ${tiles.length} hex tiles`);
-    console.log(`Sample tile centers:`, tiles.slice(0, 3).map(t => `(${t.center.x}, ${t.center.y})`));
-    setHexTiles(tiles);
+    return { q, r, s };
   }, []);
+
+  // Load map data once on mount
+  useEffect(() => {
+    loadMapData();
+  }, [loadMapData]);
+
+  // Load initial tiles when map data is ready
+  useEffect(() => {
+    if (allMapData && !isLoadingMapData) {
+      const initialCenter = getCenterHexFromCamera(camera.x, camera.y);
+      setCurrentCenterHex(initialCenter);
+      generateVisibleTiles(camera.x, camera.y, camera.zoom);
+    }
+  }, [allMapData, isLoadingMapData, camera.x, camera.y, camera.zoom, getCenterHexFromCamera, generateVisibleTiles]);
+
+  // Update tiles when camera moves or zoom changes significantly
+  useEffect(() => {
+    if (!allMapData || isLoadingMapData) return;
+    
+    const newCenterHex = getCenterHexFromCamera(camera.x, camera.y);
+    
+    // Check if center hex has changed significantly OR zoom changed
+    const distance = (Math.abs(newCenterHex.q - currentCenterHex.q) + 
+                     Math.abs(newCenterHex.r - currentCenterHex.r) + 
+                     Math.abs(newCenterHex.s - currentCenterHex.s)) / 2;
+    
+    // Reload tiles if moved more than 2 hexes OR zoom changed (more sensitive for viewport-based loading)
+    if (distance >= 2) {
+      console.log(`Camera moved significantly, reloading visible tiles`);
+      setCurrentCenterHex(newCenterHex);
+      generateVisibleTiles(camera.x, camera.y, camera.zoom);
+    }
+  }, [camera.x, camera.y, camera.zoom, currentCenterHex, allMapData, isLoadingMapData, getCenterHexFromCamera, generateVisibleTiles]);
 
   // Handle hex click
   const handleHexClick = (hexCoord: HexCoordinate) => {
@@ -126,36 +291,35 @@ export default function HexGridGame() {
       const { width, height } = canvas;
       ctx.clearRect(0, 0, width, height);
 
-      // Calculate viewport bounds for culling (simplified meter-based system)
-      const baseViewSize = 100000; // Base view size in meters at zoom level 1
-      const viewSize = baseViewSize / Math.pow(2, camera.zoom - 1);
-      const viewLeft = camera.x - viewSize / 2;
-      const viewRight = camera.x + viewSize / 2;
-      const viewTop = camera.y + viewSize / 2;
-      const viewBottom = camera.y - viewSize / 2;
-
-
+      // Calculate viewport bounds for culling
+      const scale = Math.pow(2, camera.zoom - 1) / 100000; // Scale factor to convert meters to pixels
+      const viewWidthInMeters = width / scale;
+      const viewHeightInMeters = height / scale;
+      const viewLeft = camera.x - viewWidthInMeters / 2;
+      const viewRight = camera.x + viewWidthInMeters / 2;
+      const viewTop = camera.y + viewHeightInMeters / 2;
+      const viewBottom = camera.y - viewHeightInMeters / 2;
 
       // Render visible hexes
       let visibleCount = 0;
       hexTiles.forEach(tile => {
         const worldPos = tile.center;
         
-        // Temporarily disable culling for debugging
-        // const padding = gameConfig.hexGrid.size * 0.5;
-        // if (worldPos.x < viewLeft - padding || worldPos.x > viewRight + padding ||
-        //     worldPos.y < viewBottom - padding || worldPos.y > viewTop + padding) {
-        //   return;
-        // }
+        // Cull tiles outside viewport (with generous padding)
+        const padding = gameConfig.hexGrid.size * 2; // Increased padding
+        if (worldPos.x < viewLeft - padding || worldPos.x > viewRight + padding ||
+            worldPos.y < viewBottom - padding || worldPos.y > viewTop + padding) {
+          return;
+        }
 
-        const scale = Math.pow(2, camera.zoom - 1) / 100000; // Scale factor to convert meters to pixels
         const screenX = width / 2 + (worldPos.x - camera.x) * scale;
         const screenY = height / 2 - (worldPos.y - camera.y) * scale;
 
         const pixelSize = gameConfig.hexGrid.size * scale;
 
-        // Skip if too small to see (reduced threshold for debugging)
-        if (pixelSize < 0.1) return;
+        // Skip if too small to see or off screen
+        if (pixelSize < 0.5 || screenX < -pixelSize || screenX > width + pixelSize || 
+            screenY < -pixelSize || screenY > height + pixelSize) return;
 
         visibleCount++;
         ctx.save();
@@ -178,24 +342,18 @@ export default function HexGridGame() {
           selectedHex.r === tile.coordinate.r && 
           selectedHex.s === tile.coordinate.s;
 
-        if (isSelected) {
-          ctx.fillStyle = '#fbbf24';
-        } else {
-          // Simple random terrain for demo
-          const hash = (tile.coordinate.q * 31 + tile.coordinate.r * 37) % 100;
-          ctx.fillStyle = hash < 20 ? '#3b82f6' : '#22c55e'; // 20% water, 80% land
-        }
+        ctx.fillStyle = getTerrainColor(tile.terrain, isSelected || false);
         ctx.fill();
 
         // Draw border
-        ctx.strokeStyle = isSelected ? '#f59e0b' : '#374151';
+        ctx.strokeStyle = getTerrainBorderColor(tile.terrain, isSelected || false);
         ctx.lineWidth = Math.max(1, pixelSize / 20);
         ctx.stroke();
 
         ctx.restore();
       });
 
-      console.log(`Rendered ${visibleCount} tiles at zoom ${camera.zoom.toFixed(1)}, camera (${camera.x}, ${camera.y})`);
+      console.log(`Rendered ${visibleCount}/${hexTiles.length} tiles at zoom ${camera.zoom.toFixed(1)}, camera (${camera.x.toFixed(0)}, ${camera.y.toFixed(0)}), scale: ${scale.toFixed(6)}, viewSize: ${viewWidthInMeters.toFixed(0)}x${viewHeightInMeters.toFixed(0)}m`);
     };
 
     render();
@@ -260,16 +418,12 @@ export default function HexGridGame() {
       setGestureState(prev => ({ ...prev, hasMoved: true }));
       
       const scale = Math.pow(2, camera.zoom - 1) / 100000;
-      
-      // Define map boundaries
-      const mapWidth = gameConfig.hexGrid.mapWidth;
-      const mapHeight = gameConfig.hexGrid.mapHeight;
 
-      // Update camera position with boundary checks
+      // Update camera position without boundary restrictions
       setCamera(prev => ({
         ...prev,
-        x: Math.max(-mapWidth / 3, Math.min(mapWidth / 3, prev.x - dx / scale)),
-        y: Math.max(-mapHeight / 3, Math.min(mapHeight / 3, prev.y + dy / scale))
+        x: prev.x - dx / scale,
+        y: prev.y + dy / scale
       }));
 
       setGestureState(prev => ({
@@ -332,16 +486,12 @@ export default function HexGridGame() {
         
         // Use same scale calculation as mouse drag for consistency
         const scale = Math.pow(2, camera.zoom - 1) / 100000; // pixels per meter
-        
-        // Define map boundaries
-        const mapWidth = gameConfig.hexGrid.mapWidth;
-        const mapHeight = gameConfig.hexGrid.mapHeight;
 
-        // Update camera position with boundary checks
+        // Update camera position without boundary restrictions
         setCamera(prev => ({
           ...prev,
-          x: Math.max(-mapWidth / 3, Math.min(mapWidth / 3, prev.x - dx / scale)),
-          y: Math.max(-mapHeight / 3, Math.min(mapHeight / 3, prev.y + dy / scale))
+          x: prev.x - dx / scale,
+          y: prev.y + dy / scale
         }));
 
         setGestureState(prev => ({
@@ -452,8 +602,10 @@ export default function HexGridGame() {
       // Set a debounced timeout to hide overlay and trigger rerender
       resizeTimeout = setTimeout(() => {
         setIsResizing(false);
-        // Force a rerender by updating camera state (triggers canvas redraw)
-        setCamera(prev => ({ ...prev }));
+        // Reload tiles for new viewport size
+        if (allMapData && !isLoadingMapData) {
+          generateVisibleTiles(camera.x, camera.y, camera.zoom);
+        }
       }, 300); // 300ms delay after resize stops
     };
 
@@ -546,6 +698,19 @@ export default function HexGridGame() {
         <div className="absolute bottom-4 left-1/2 transform -translate-x-1/2 bg-white dark:bg-gray-800 bg-opacity-90 backdrop-blur-md rounded-lg shadow-lg px-4 py-3 min-w-[200px] z-40">
           <h3 className="text-sm font-semibold text-gray-900 dark:text-gray-100 mb-1">Hex Coordinates</h3>
           <p className="text-xs text-gray-700 dark:text-gray-300">q: {focusedTile.coordinate.q}, r: {focusedTile.coordinate.r}, s: {focusedTile.coordinate.s}</p>
+          <p className="text-xs text-gray-700 dark:text-gray-300 capitalize">Terrain: {focusedTile.terrain}</p>
+        </div>
+      )}
+      
+      {/* Loading overlay */}
+      {(isLoadingMapData || isLoadingTiles) && (
+        <div className="absolute top-4 left-1/2 transform -translate-x-1/2 bg-white dark:bg-gray-800 bg-opacity-90 backdrop-blur-md rounded-lg shadow-lg px-4 py-2 z-40">
+          <div className="flex items-center space-x-2">
+            <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-blue-600"></div>
+            <span className="text-sm text-gray-800 dark:text-gray-200">
+              {isLoadingMapData ? 'Loading map data...' : 'Generating tiles...'}
+            </span>
+          </div>
         </div>
       )}
       
